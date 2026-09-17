@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+
+declare -A MAP
+declare -a ARGUMENTS
+
+die() {
+	echo "unittest: $*" >&2
+	exit 1
+}
+
+cleanup() {
+	rm -rf "${WORKDIR}"
+}
+
+trap cleanup EXIT
+
+WORKDIR="$(mktemp -d unittest.XXXXXXXX)" || die "Failed to create temporary directory."
+
+parse() {
+	local FILENAME=$1
+	local DIRECTIVE
+	local ARGS
+
+	# Read performs whitespace splitting.
+	while read -r DIRECTIVE ARGS; do
+		case "${DIRECTIVE}" in
+		//@[a-z]* | @[a-z]*)
+			DIRECTIVE="${DIRECTIVE#//}"
+			DIRECTIVE="${DIRECTIVE#@}"
+			# In case of duplicates, the last wins.
+			MAP["${DIRECTIVE}"]="${ARGS}"
+			;;
+		esac
+	done <"${FILENAME}"
+}
+
+# Lookup DIRECTIVE; sets global VALUE if found.
+lookup() {
+	local DIRECTIVE=$1
+
+	[[ -v MAP["${DIRECTIVE}"] ]] || return 1
+	VALUE="${MAP["${DIRECTIVE}"]}"
+	return 0
+}
+
+build() {
+	local COMMAND=$1
+	local FILENAME=$2
+	local UUT=$3
+
+	rm -f -- "${UUT}"
+
+	bash -c "${COMMAND} \"\$1\" -o \"\$2\"" _ "${FILENAME}" "${UUT}"
+}
+
+extract_expected() {
+	local FILENAME=$1
+	local OUTPUT=$2
+
+	awk '
+        /^(@|\/\/@)expected$/ {
+            inside = 1
+            next
+        }
+
+        /^(@|\/\/@)expected\.$/ {
+            exit
+        }
+
+        inside {
+            print
+        }
+        ' "${FILENAME}" >"${OUTPUT}"
+}
+
+run() {
+	local FILENAME=$1
+	local UUT=$2
+	local EXPECTED
+
+	if lookup "args"; then
+		# Parse @args using xargs word splitting and quoting.
+		xargs printf '%s\0' >"${WORKDIR}/args" <<<"${VALUE}" || die "Invalid @args directive."
+		mapfile -d '' -t ARGUMENTS <"${WORKDIR}/args"
+	fi
+
+	if lookup "expected"; then
+		EXPECTED=${VALUE}
+
+		"./${UUT}" "${ARGUMENTS[@]}" >"${WORKDIR}/actual"
+		UUT_STATUS=$?
+
+		if [[ -z ${EXPECTED} ]]; then
+			extract_expected "${FILENAME}" "${WORKDIR}/expected"
+			EXPECTED="${WORKDIR}/expected"
+		elif [[ ! -f ${EXPECTED} ]]; then
+			die "Missing @expected filename '${EXPECTED}'."
+		fi
+
+		diff -up "${EXPECTED}" "${WORKDIR}/actual"
+		DIFF_STATUS=$?
+		if ((DIFF_STATUS)); then
+			return "${DIFF_STATUS}"
+		fi
+	else
+		"./${UUT}" "${ARGUMENTS[@]}"
+		UUT_STATUS=$?
+		return "${UUT_STATUS}"
+	fi
+
+	return "${UUT_STATUS}"
+}
+
+verdict() {
+	local VERDICT=$1
+	local FILENAME=$2
+
+	printf "%s:\t%s" "${VERDICT}" "${FILENAME}" >&2
+
+	if ((UUT_STATUS)); then
+		printf " (exit %d" "${UUT_STATUS}" >&2
+		((DIFF_STATUS)) && printf ", output mismatch" >&2
+		printf ")" >&2
+	elif ((DIFF_STATUS)); then
+		printf " (output mismatch)" >&2
+	fi
+
+	printf "\n" >&2
+}
+
+teardown() {
+	local COMMAND=$1
+
+	bash -c "${COMMAND}"
+}
+
+for FILENAME in "$@"; do
+	MAP=()
+	ARGUMENTS=()
+	XFAIL=
+	UUT_STATUS=0
+	DIFF_STATUS=0
+
+	parse "${FILENAME}"
+
+	lookup "unittest" || die "Missing @unittest directive."
+	unittest=${VALUE}
+
+	if lookup "uut"; then
+		UUT=${VALUE}
+	else
+		# Derive the unit-under-test filename from the basename.
+		BASENAME=${FILENAME##*/}
+		UUT=${BASENAME%.*}
+	fi
+
+	build "$unittest" "${FILENAME}" "${UUT}" || exit 1
+
+	if lookup "xfail"; then
+		XFAIL=1
+	fi
+
+	run "${FILENAME}" "${UUT}"
+	STATUS=$?
+
+	if ((STATUS == 0)); then
+		if ((XFAIL)); then
+			verdict "XPASS" "${FILENAME}"
+			STATUS=1
+		else
+			verdict "PASS" "${FILENAME}"
+		fi
+	elif ((XFAIL)); then
+		verdict "XFAIL" "${FILENAME}"
+		STATUS=0
+	else
+		verdict "FAIL" "${FILENAME}"
+	fi
+
+	if lookup "teardown"; then
+		teardown "${VALUE}" || exit 1
+	fi
+
+	((STATUS == 0)) || exit 1
+done
